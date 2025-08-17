@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capivara"
+version = "0.1.0"
+description = "CapivaraVM - JVM interpretada em Python (alvo: Java 8 classfiles, major 52.0)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Mateus Gomes de Araújo"}
+]
+license = {text = "MIT"}
+keywords = ["JVM", "Java", "classfile", "bytecode", "interpreter", "education"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Software Development :: Interpreters",
+  "Topic :: Education"
+]
+dependencies = []
+
+[project.scripts]
+capivara = "capivara.cli.__main__:main"

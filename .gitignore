@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Venv
+.venv/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# Editor
+.vscode/
+.idea/
+
+# Tests
+.capivara_test_tmp/
