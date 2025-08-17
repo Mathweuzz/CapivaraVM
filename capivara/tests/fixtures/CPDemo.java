@@ -1,5 +1,5 @@
 public class CPDemo {
-    static int XI = 42;
+    static final int XI = 42; // final garante ConstantValue
 
     static long keep() {
         return 1234567890123L;
