@@ -60,7 +60,7 @@ class TestFrame(unittest.TestCase):
         fr = Frame(max_locals=8, max_stack=8)
 
         fr.push_int(10)
-        fr.push_long(0x100000000)  # cabe em 64b
+        fr.push_long(0x100000000)  # 4_294_967_296 cabe em 64b (positivo)
         fr.push_double(3.14)
         fr.push_ref(None)
         # Stack: [int, long, TOP, double, TOP, ref] => 6 slots
@@ -73,7 +73,8 @@ class TestFrame(unittest.TestCase):
         d = fr.pop_double()
         self.assertAlmostEqual(d, 3.14, places=6)
         l = fr.pop_long()
-        self.assertEqual(l, 0x100000000 - (1 << 32))  # signed
+        # Correto para long (64b com sinal): 0x100000000 é positivo
+        self.assertEqual(l, 0x100000000)
         i = fr.pop_int()
         self.assertEqual(i, 10)
         with self.assertRaises(StackUnderflowError):
@@ -101,6 +102,16 @@ class TestFrame(unittest.TestCase):
         fr.push_int(1)
         with self.assertRaises(StackOverflowError):
             fr.push_double(1.0)
+            
+    def test_long_negative_sign(self):
+        fr = Frame(max_locals=2, max_stack=3)
+        fr.push_long(-1)       # deve preservar -1
+        self.assertEqual(fr.pop_long(), -1)
+
+        # Também valida conversão de 64 bits com sinal via máscara cheia
+        fr.push_long(0xFFFFFFFFFFFFFFFF)  # -1 em 64b
+        self.assertEqual(fr.pop_long(), -1)
+
 
 class TestStringPool(unittest.TestCase):
     def test_intern_identity(self):
