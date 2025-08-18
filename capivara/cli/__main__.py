@@ -5,18 +5,21 @@ from typing import List
 
 from capivara import __version__
 from capivara.util.logging import configure_logger
+from capivara.loader.loader import ClassLoader
+from capivara.runtime.klass import RuntimeClass
+from capivara.classfile.attributes import CodeAttribute
+from capivara.util import flags as FL
+from capivara.interp.loop import Interpreter
 
-# Códigos de saída (inspirados em sysexits.h)
 EX_OK = 0
-EX_USAGE = 64          # uso incorreto de comando/argumento
-EX_NOINPUT = 66        # entrada ausente (ex.: classpath inexiste)
-EX_UNAVAILABLE = 69    # serviço indisponível (funcionalidade não implementada)
+EX_USAGE = 64
+EX_NOINPUT = 66
+EX_UNAVAILABLE = 69
 
 def _split_classpath(cp: str) -> List[str]:
     return [p for p in cp.split(":") if p]
 
 def _normalize_main(name: str) -> str:
-    # Aceita "pkg.Main" e normaliza para "pkg/Main"
     return name.replace(".", "/")
 
 def _validate_classpath(paths: List[str]) -> None:
@@ -26,6 +29,38 @@ def _validate_classpath(paths: List[str]) -> None:
             f"[capivara] ERRO: entradas de classpath inexistentes: {missing}\n"
         )
         sys.exit(EX_NOINPUT)
+
+def _run_static_noargs(classpath: List[str], main_bin: str, entry: str, desc: str) -> int:
+    """
+    Carrega classe e executa método static <entry><desc> sem args.
+    Suporta apenas retorno void ou int neste passo.
+    """
+    ld = ClassLoader(classpath)
+    rc: RuntimeClass = ld.load_class(main_bin)
+
+    m = rc.find_method(entry, desc)
+    if not m:
+        sys.stderr.write(f"[capivara] método não encontrado: {entry}{desc}\n")
+        return EX_USAGE
+    if (m.access_flags & FL.ACC_STATIC) == 0:
+        sys.stderr.write(f"[capivara] método não é static: {entry}{desc}\n")
+        return EX_USAGE
+
+    code: CodeAttribute | None = None
+    for a in m.attributes:
+        if isinstance(a, CodeAttribute):
+            code = a
+            break
+    if not code:
+        sys.stderr.write("[capivara] método sem atributo Code\n")
+        return EX_UNAVAILABLE
+
+    interp = Interpreter()
+    res = interp.exec_code(code.code, code.max_locals, code.max_stack)
+
+    if res.kind == "int":
+        print(f"RET: {res.int_value}")
+    return EX_OK
 
 def _cmd_run(args: argparse.Namespace) -> int:
     logger = configure_logger(args.loglevel)
@@ -37,10 +72,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     logger.info("Main class requisitada: %s", main_bin)
     logger.info("Classpath: %s", classpath)
 
-    # Passo 1: ainda não implementado o interpretador/loader.
+    # Novo: se usuário informar entry/desc, executamos método static (sem args)
+    if args.entry and args.desc:
+        return _run_static_noargs(classpath, main_bin, args.entry, args.desc)
+
+    # Comportamento antigo (preservado p/ testes anteriores):
     sys.stderr.write(
-        "CapivaraVM: interpretador ainda não implementado (Passo 1). "
-        "Argumentos aceitos e validados com sucesso.\n"
+        "CapivaraVM: interpretador ainda não implementado para 'main' padrão "
+        "(sem --entry/--desc neste passo). Argumentos aceitos e validados.\n"
     )
     return EX_UNAVAILABLE
 
@@ -50,39 +89,25 @@ def build_parser() -> argparse.ArgumentParser:
         description="CapivaraVM — JVM interpretada em Python (alvo: Java 8).",
     )
     parser.add_argument(
-        "--version",
-        action="version",
-        version=f"CapivaraVM {__version__}",
-        help="Exibe a versão e sai.",
+        "--version", action="version", version=f"CapivaraVM {__version__}"
     )
 
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = subparsers.add_parser(
         "run",
-        help="Executa uma classe principal Java (stub no Passo 1).",
-        description="Executa uma classe com método main(String[]). (Stub no Passo 1.)",
+        help="Executa uma classe Java.",
+        description="Executa uma classe Java. (Neste passo: use --entry/--desc para método static sem args.)",
     )
-    p_run.add_argument(
-        "main_class",
-        help="Nome da classe principal (ex.: pkg.Main). Aceita ponto ou barra.",
-    )
-    p_run.add_argument(
-        "--cp",
-        "--classpath",
-        dest="classpath",
-        default=".",
-        help="Classpath (dirs e/ou .jar separados por ':'). Default='.'.",
-    )
-    p_run.add_argument(
-        "--log",
-        dest="loglevel",
-        default=None,
-        help="Nível de log (DEBUG, INFO, WARNING, ERROR). "
-             "Sobrescreve $CAPIVARA_LOG.",
-    )
-    p_run.set_defaults(func=_cmd_run)
+    p_run.add_argument("main_class", help="Nome da classe (ex.: pkg.Main).")
+    p_run.add_argument("--cp", "--classpath", dest="classpath", default=".", help="Classpath (dirs/jars separados por ':').")
+    p_run.add_argument("--log", dest="loglevel", default=None, help="Nível de log.")
 
+    # Novos argumentos para este passo:
+    p_run.add_argument("--entry", help="Nome do método static a executar (ex.: run).")
+    p_run.add_argument("--desc", help="Descritor do método (ex.: ()I, ()V).")
+
+    p_run.set_defaults(func=_cmd_run)
     return parser
 
 def main(argv: List[str] | None = None) -> None:
@@ -92,7 +117,6 @@ def main(argv: List[str] | None = None) -> None:
         exit_code = args.func(args)
         sys.exit(exit_code)
     except AttributeError:
-        # Nenhum subcomando → uso incorreto
         parser.print_usage(sys.stderr)
         sys.exit(EX_USAGE)
 
