@@ -65,6 +65,29 @@ class Interpreter:
         desc = cp.get_utf8(nt.descriptor_index)
         return owner, name, desc
 
+    def _lookup_static_in_hierarchy(self, owner_name: str, name: str, desc: str) -> Tuple[RuntimeClass, CodeAttribute]:
+        """
+        Carrega o RuntimeClass do owner e procura (name, desc) subindo por superclasses.
+        Retorna (RuntimeClass onde foi encontrado, CodeAttribute).
+        """
+        rc = self.loader.load_class(owner_name)
+        while True:
+            m = rc.find_method(name, desc)
+            if m and (m.access_flags & FL.ACC_STATIC):
+                code: CodeAttribute | None = None
+                for a in m.attributes:
+                    if isinstance(a, CodeAttribute):
+                        code = a
+                        break
+                if not code:
+                    raise RuntimeError("método alvo sem atributo Code")
+                return rc, code
+            # sobe superclasse
+            if not rc.super_name:
+                break
+            rc = self.loader.load_class(rc.super_name)
+        raise LookupError(f"método não encontrado (static): {owner_name}.{name}{desc}")
+
     # ===== Execução de um método (frame) =====
     def _run_frame(self, rc: RuntimeClass, code: CodeAttribute, frame: Frame) -> ExecResult:
         cp = rc.cf.constant_pool
@@ -173,17 +196,12 @@ class Interpreter:
                 index = (idx_hi << 8) | idx_lo
                 owner, name, desc = self._resolve_methodref(cp, index)
 
-                # Resolve classe e método
-                target_rc: RuntimeClass = self.loader.load_class(owner)
-                target_m = target_rc.find_method(name, desc)
-                if not target_m:
-                    raise LookupError(f"método não encontrado: {owner}.{name}{desc}")
-                if (target_m.access_flags & FL.ACC_STATIC) == 0:
-                    raise TypeError(f"método não é static: {owner}.{name}{desc}")
+                # Resolve método estático subindo hierarquia (owner pode não declarar o método)
+                target_rc, code_attr = self._lookup_static_in_hierarchy(owner, name, desc)
 
                 # Parse descritor e coletar argumentos da pilha (direita→esquerda)
                 params, ret = parse_method_descriptor(desc)
-                # Suporte neste passo: somente parâmetros 1-slot (int). (long/double virão depois)
+                # Suporte neste passo: apenas params int (1-slot)
                 arg_vals: List[int] = []
                 for p in reversed(params):
                     if isinstance(p, BaseType) and p.code == "I":
@@ -192,23 +210,13 @@ class Interpreter:
                         raise NotImplementedError("apenas parâmetros int neste passo")
                 arg_vals.reverse()
 
-                # Code alvo
-                code_attr: CodeAttribute | None = None
-                for a in target_m.attributes:
-                    if isinstance(a, CodeAttribute):
-                        code_attr = a
-                        break
-                if not code_attr:
-                    raise RuntimeError("método alvo sem atributo Code")
-
-                # Cria frame do callee e injeta argumentos nos locals 0..n-1
+                # Cria frame do callee e injeta args
                 callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
                 for i, v in enumerate(arg_vals):
                     callee.set_local_int(i, v)
 
                 # Executa recursivamente
                 res = self._run_frame(target_rc, code_attr, callee)
-                # Retorno (int/void por enquanto)
                 if isinstance(ret, BaseType) and ret.code == "I":
                     frame.push_int(res.int_value if res.int_value is not None else 0)
                 elif isinstance(ret, BaseType) and ret.code == "V":
@@ -251,5 +259,4 @@ class Interpreter:
 
     def execute_static_entry(self, main_bin: str, name: str, desc: str) -> ExecResult:
         rc = self.loader.load_class(main_bin)
-        # (Opcional: validar ACC_STATIC do entry; o teste usa static)
         return self.execute_method(rc, name, desc)
