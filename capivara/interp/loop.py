@@ -4,11 +4,12 @@ from typing import Optional, List, Tuple
 
 from capivara.util import opcodes as OP
 from capivara.runtime.frame import Frame
-from capivara.util.descriptors import parse_method_descriptor, BaseType
+from capivara.util.descriptors import parse_method_descriptor, parse_field_descriptor, BaseType, ObjectType, ArrayType
 from capivara.loader.loader import ClassLoader
 from capivara.runtime.klass import RuntimeClass
+from capivara.runtime.heap import VMObject
 from capivara.classfile.constant_pool import (
-    ConstantPool, CpMethodref, CpClass, CpNameAndType
+    ConstantPool, CpMethodref, CpClass, CpNameAndType, CpFieldref
 )
 from capivara.classfile.attributes import CodeAttribute
 from capivara.util import flags as FL
@@ -20,8 +21,7 @@ class ExecResult:
 
 class Interpreter:
     """
-    Intérprete com suporte a invocações (neste passo: invokestatic).
-    Mantém referência ao ClassLoader para resolver classes/métodos.
+    Intérprete com invocações e objetos básicos.
     """
     def __init__(self, loader: ClassLoader):
         self.loader = loader
@@ -48,11 +48,8 @@ class Interpreter:
             raise ZeroDivisionError("divisão por zero (irem)")
         return a - int(a / b) * b
 
-    # ===== resolução CP → método =====
+    # ===== resolução CP =====
     def _resolve_methodref(self, cp: ConstantPool, index: int) -> Tuple[str, str, str]:
-        """
-        Retorna (owner_internal_name, method_name, descriptor) a partir de um índice Methodref.
-        """
         e = cp.get(index)
         if not isinstance(e, CpMethodref):
             raise TypeError("índice não é Methodref")
@@ -65,11 +62,20 @@ class Interpreter:
         desc = cp.get_utf8(nt.descriptor_index)
         return owner, name, desc
 
+    def _resolve_fieldref(self, cp: ConstantPool, index: int) -> Tuple[str, str, str]:
+        e = cp.get(index)
+        if not isinstance(e, CpFieldref):
+            raise TypeError("índice não é Fieldref")
+        cls = cp.get(e.class_index)
+        assert isinstance(cls, CpClass)
+        owner = cp.get_utf8(cls.name_index)
+        nt = cp.get(e.name_and_type_index)
+        assert isinstance(nt, CpNameAndType)
+        name = cp.get_utf8(nt.name_index)
+        desc = cp.get_utf8(nt.descriptor_index)
+        return owner, name, desc
+
     def _lookup_static_in_hierarchy(self, owner_name: str, name: str, desc: str) -> Tuple[RuntimeClass, CodeAttribute]:
-        """
-        Carrega o RuntimeClass do owner e procura (name, desc) subindo por superclasses.
-        Retorna (RuntimeClass onde foi encontrado, CodeAttribute).
-        """
         rc = self.loader.load_class(owner_name)
         while True:
             m = rc.find_method(name, desc)
@@ -82,11 +88,44 @@ class Interpreter:
                 if not code:
                     raise RuntimeError("método alvo sem atributo Code")
                 return rc, code
-            # sobe superclasse
             if not rc.super_name:
                 break
             rc = self.loader.load_class(rc.super_name)
         raise LookupError(f"método não encontrado (static): {owner_name}.{name}{desc}")
+
+    def _lookup_instance_in_hierarchy(self, rc: RuntimeClass, name: str, desc: str) -> Tuple[RuntimeClass, CodeAttribute]:
+        cur = rc
+        while True:
+            m = cur.find_method(name, desc)
+            if m and (m.access_flags & FL.ACC_STATIC) == 0:
+                code: CodeAttribute | None = None
+                for a in m.attributes:
+                    if isinstance(a, CodeAttribute):
+                        code = a
+                        break
+                if not code:
+                    raise RuntimeError("método alvo sem atributo Code")
+                return cur, code
+            if not cur.super_name:
+                break
+            cur = self.loader.load_class(cur.super_name)
+        raise LookupError(f"método não encontrado (instance): {rc.name}.{name}{desc}")
+
+    def _lookup_field_in_hierarchy(self, owner_name: str, name: str, desc: str, expect_static: bool) -> Tuple[RuntimeClass, bool]:
+        rc = self.loader.load_class(owner_name)
+        while True:
+            cp = rc.cf.constant_pool
+            for f in rc.cf.fields:
+                is_static = (f.access_flags & FL.ACC_STATIC) != 0
+                if is_static != expect_static:
+                    continue
+                if cp.get_utf8(f.name_index) == name and cp.get_utf8(f.descriptor_index) == desc:
+                    return rc, is_static
+            if not rc.super_name:
+                break
+            rc = self.loader.load_class(rc.super_name)
+        kind = "static" if expect_static else "instance"
+        raise LookupError(f"campo não encontrado ({kind}): {owner_name}.{name}{desc}")
 
     # ===== Execução de um método (frame) =====
     def _run_frame(self, rc: RuntimeClass, code: CodeAttribute, frame: Frame) -> ExecResult:
@@ -99,9 +138,11 @@ class Interpreter:
             op = code_bytes[pc]
             pc += 1
 
-            # ===== Constantes =====
+            # ===== Constantes / refs =====
             if op == OP.NOP:
                 continue
+            elif op == OP.ACONST_NULL:
+                frame.push_ref(None)
             elif OP.ICONST_M1 <= op <= OP.ICONST_5:
                 v = -1 if op == OP.ICONST_M1 else (op - OP.ICONST_0)
                 frame.push_int(v)
@@ -112,7 +153,7 @@ class Interpreter:
                 hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 frame.push_int(self._s2(hi, lo))
 
-            # ===== Loads/Stores =====
+            # ===== Loads/Stores (int/ref) =====
             elif op == OP.ILOAD:
                 idx = code_bytes[pc]; pc += 1
                 frame.push_int(frame.get_local_int(idx))
@@ -127,13 +168,32 @@ class Interpreter:
                 idx = op - OP.ISTORE_0
                 v = frame.pop_int()
                 frame.set_local_int(idx, v)
-            elif op == OP.IINC:
-                idx = code_bytes[pc]; const = self._s1(code_bytes[pc+1]); pc += 2
-                cur = frame.get_local_int(idx)
-                frame.set_local_int(idx, cur + const)
-            elif op == OP.INEG:
-                v = frame.pop_int()
-                frame.push_int(-v)
+
+            elif op == OP.ALOAD:
+                idx = code_bytes[pc]; pc += 1
+                frame.push_ref(frame.get_local_ref(idx))
+            elif op in (OP.ALOAD_0, OP.ALOAD_1, OP.ALOAD_2, OP.ALOAD_3):
+                idx = op - OP.ALOAD_0
+                frame.push_ref(frame.get_local_ref(idx))
+            elif op == OP.ASTORE:
+                idx = code_bytes[pc]; pc += 1
+                r = frame.pop_ref()
+                frame.set_local_ref(idx, r)
+            elif op in (OP.ASTORE_0, OP.ASTORE_1, OP.ASTORE_2, OP.ASTORE_3):
+                idx = op - OP.ASTORE_0
+                r = frame.pop_ref()
+                frame.set_local_ref(idx, r)
+
+            # ===== Pilha: dup/pop =====
+            elif op == OP.DUP:
+                top = frame.pop_slot()
+                frame.ostack.append(top)
+                frame.ostack.append(top)
+            elif op == OP.POP:
+                top = frame.pop_slot()
+                if getattr(top, "__class__", None).__name__ == "VMTop":
+                    # pop erroneamente sobre 2-slot; remover também o valor
+                    frame.pop_slot()
 
             # ===== Aritmética =====
             elif op == OP.IADD:
@@ -151,8 +211,15 @@ class Interpreter:
             elif op == OP.IREM:
                 b = frame.pop_int(); a = frame.pop_int()
                 frame.push_int(self._irem(a, b))
+            elif op == OP.IINC:
+                idx = code_bytes[pc]; const = self._s1(code_bytes[pc+1]); pc += 2
+                cur = frame.get_local_int(idx)
+                frame.set_local_int(idx, cur + const)
+            elif op == OP.INEG:
+                v = frame.pop_int()
+                frame.push_int(-v)
 
-            # ===== Condicionais (1 operando) =====
+            # ===== Condicionais =====
             elif op in (OP.IFEQ, OP.IFNE, OP.IFLT, OP.IFGE, OP.IFGT, OP.IFLE):
                 hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 off = self._s2(hi, lo)
@@ -167,8 +234,6 @@ class Interpreter:
                 )
                 if cond:
                     pc = pc + off - 3
-
-            # ===== Condicionais (2 operandos) =====
             elif op in (OP.IF_ICMPEQ, OP.IF_ICMPNE, OP.IF_ICMPLT, OP.IF_ICMPGE, OP.IF_ICMPGT, OP.IF_ICMPLE):
                 hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 off = self._s2(hi, lo)
@@ -190,18 +255,66 @@ class Interpreter:
                 off = self._s2(hi, lo)
                 pc = pc + off - 3
 
+            # ===== Campos estáticos =====
+            elif op == OP.GETSTATIC:
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_fieldref(cp, idx)
+                decl_rc, _ = self._lookup_field_in_hierarchy(owner, name, desc, expect_static=True)
+                val = decl_rc.statics[(name, desc)]
+                t = parse_field_descriptor(desc)
+                if isinstance(t, BaseType) and t.code == "I":
+                    frame.push_int(val.value)
+                else:
+                    # array/obj
+                    frame.push_ref(val.value)
+            elif op == OP.PUTSTATIC:
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_fieldref(cp, idx)
+                decl_rc, _ = self._lookup_field_in_hierarchy(owner, name, desc, expect_static=True)
+                t = parse_field_descriptor(desc)
+                if isinstance(t, BaseType) and t.code == "I":
+                    v = frame.pop_int()
+                else:
+                    v = frame.pop_ref()
+                decl_rc.statics[(name, desc)].value = v
+
+            # ===== Campos de instância =====
+            elif op == OP.GETFIELD:
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_fieldref(cp, idx)
+                ref = frame.pop_ref()
+                if ref is None:
+                    raise RuntimeError("NullPointerException (getfield)")
+                obj = self.loader.heap.get(ref)
+                decl_rc, _ = self._lookup_field_in_hierarchy(owner, name, desc, expect_static=False)
+                val = obj.fields[(decl_rc.name, name, desc)]
+                t = parse_field_descriptor(desc)
+                if isinstance(t, BaseType) and t.code == "I":
+                    frame.push_int(val.value)
+                else:
+                    frame.push_ref(val.value)
+            elif op == OP.PUTFIELD:
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_fieldref(cp, idx)
+                t = parse_field_descriptor(desc)
+                if isinstance(t, BaseType) and t.code == "I":
+                    v = frame.pop_int()
+                else:
+                    v = frame.pop_ref()
+                ref = frame.pop_ref()
+                if ref is None:
+                    raise RuntimeError("NullPointerException (putfield)")
+                obj = self.loader.heap.get(ref)
+                decl_rc, _ = self._lookup_field_in_hierarchy(owner, name, desc, expect_static=False)
+                obj.fields[(decl_rc.name, name, desc)].value = v
+
             # ===== Invocações =====
             elif op == OP.INVOKESTATIC:
                 idx_hi = code_bytes[pc]; idx_lo = code_bytes[pc+1]; pc += 2
                 index = (idx_hi << 8) | idx_lo
                 owner, name, desc = self._resolve_methodref(cp, index)
-
-                # Resolve método estático subindo hierarquia (owner pode não declarar o método)
                 target_rc, code_attr = self._lookup_static_in_hierarchy(owner, name, desc)
-
-                # Parse descritor e coletar argumentos da pilha (direita→esquerda)
                 params, ret = parse_method_descriptor(desc)
-                # Suporte neste passo: apenas params int (1-slot)
                 arg_vals: List[int] = []
                 for p in reversed(params):
                     if isinstance(p, BaseType) and p.code == "I":
@@ -209,26 +322,88 @@ class Interpreter:
                     else:
                         raise NotImplementedError("apenas parâmetros int neste passo")
                 arg_vals.reverse()
-
-                # Cria frame do callee e injeta args
                 callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
                 for i, v in enumerate(arg_vals):
                     callee.set_local_int(i, v)
-
-                # Executa recursivamente
                 res = self._run_frame(target_rc, code_attr, callee)
                 if isinstance(ret, BaseType) and ret.code == "I":
                     frame.push_int(res.int_value if res.int_value is not None else 0)
                 elif isinstance(ret, BaseType) and ret.code == "V":
                     pass
                 else:
-                    raise NotImplementedError("retornos não-int/void virão em passos seguintes")
+                    raise NotImplementedError("retornos não-int/void virão depois")
 
             elif op == OP.INVOKESPECIAL:
-                raise NotImplementedError("invokespecial será habilitado no Passo 8 (objetos)")
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_methodref(cp, idx)
+                # construtores e super chamadas: usa classe resolvida (owner)
+                target_rc = self.loader.load_class(owner)
+
+                params, ret = parse_method_descriptor(desc)
+                # coletar args (direita->esquerda) e 'this'
+                arg_vals: List[int] = []
+                for p in reversed(params):
+                    if isinstance(p, BaseType) and p.code == "I":
+                        arg_vals.append(frame.pop_int())
+                    else:
+                        raise NotImplementedError("apenas parâmetros int neste passo")
+                arg_vals.reverse()
+                this_ref = frame.pop_ref()
+                if this_ref is None:
+                    raise RuntimeError("NullPointerException (invokespecial)")
+
+                # localizar Code do método na hierarquia do owner
+                _, code_attr = self._lookup_instance_in_hierarchy(target_rc, name, desc)
+
+                callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
+                callee.set_local_ref(0, this_ref)
+                for i, v in enumerate(arg_vals, start=1):
+                    callee.set_local_int(i, v)
+
+                res = self._run_frame(target_rc, code_attr, callee)
+                # construtor/void -> nada a empilhar
 
             elif op == OP.INVOKEVIRTUAL:
-                raise NotImplementedError("invokevirtual será habilitado no Passo 8 (objetos)")
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                owner, name, desc = self._resolve_methodref(cp, idx)
+                params, ret = parse_method_descriptor(desc)
+                arg_vals: List[int] = []
+                for p in reversed(params):
+                    if isinstance(p, BaseType) and p.code == "I":
+                        arg_vals.append(frame.pop_int())
+                    else:
+                        raise NotImplementedError("apenas parâmetros int neste passo")
+                arg_vals.reverse()
+                this_ref = frame.pop_ref()
+                if this_ref is None:
+                    raise RuntimeError("NullPointerException (invokevirtual)")
+                this_obj = self.loader.heap.get(this_ref)
+                dyn_rc = self.loader.load_class(this_obj.class_name)
+
+                # despacho dinâmico
+                _, code_attr = self._lookup_instance_in_hierarchy(dyn_rc, name, desc)
+
+                callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
+                callee.set_local_ref(0, this_ref)
+                for i, v in enumerate(arg_vals, start=1):
+                    callee.set_local_int(i, v)
+
+                res = self._run_frame(dyn_rc, code_attr, callee)
+                if isinstance(ret, BaseType) and ret.code == "I":
+                    frame.push_int(res.int_value if res.int_value is not None else 0)
+                elif isinstance(ret, BaseType) and ret.code == "V":
+                    pass
+                else:
+                    raise NotImplementedError("retornos não-int/void virão depois")
+
+            # ===== Alocação =====
+            elif op == OP.NEW:
+                idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
+                e = cp.get(idx); assert isinstance(e, CpClass)
+                class_name = cp.get_utf8(e.name_index)
+                rc_new = self.loader.load_class(class_name)
+                oid = self.loader.heap.new_object(rc_new, self.loader)
+                frame.push_ref(oid)
 
             # ===== Retornos =====
             elif op == OP.IRETURN:

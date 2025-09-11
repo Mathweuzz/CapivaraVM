@@ -14,8 +14,10 @@ CP_MethodHandle       = 15
 CP_MethodType         = 16
 CP_InvokeDynamic      = 18
 
-# ===== Bytecodes essenciais  =====
+# ===== Bytecodes essenciais =====
 NOP        = 0x00
+
+ACONST_NULL= 0x01
 
 ICONST_M1  = 0x02
 ICONST_0   = 0x03
@@ -29,21 +31,33 @@ BIPUSH     = 0x10
 SIPUSH     = 0x11
 
 ILOAD      = 0x15
-LLOAD      = 0x16  
-FLOAD      = 0x17 
-DLOAD      = 0x18 
-ALOAD      = 0x19 
+LLOAD      = 0x16
+FLOAD      = 0x17
+DLOAD      = 0x18
+ALOAD      = 0x19
 
 ILOAD_0    = 0x1a
 ILOAD_1    = 0x1b
 ILOAD_2    = 0x1c
 ILOAD_3    = 0x1d
+ALOAD_0    = 0x2a
+ALOAD_1    = 0x2b
+ALOAD_2    = 0x2c
+ALOAD_3    = 0x2d
 
 ISTORE     = 0x36
 ISTORE_0   = 0x3b
 ISTORE_1   = 0x3c
 ISTORE_2   = 0x3d
 ISTORE_3   = 0x3e
+ASTORE     = 0x3a
+ASTORE_0   = 0x4b
+ASTORE_1   = 0x4c
+ASTORE_2   = 0x4d
+ASTORE_3   = 0x4e
+
+POP        = 0x57
+DUP        = 0x59
 
 IADD       = 0x60
 ISUB       = 0x64
@@ -70,13 +84,19 @@ IF_ICMPLE  = 0xa4
 GOTO       = 0xa7
 
 IRETURN    = 0xac
-LRETURN    = 0xad 
-FRETURN    = 0xae 
-DRETURN    = 0xaf 
-ARETURN    = 0xb0 
+LRETURN    = 0xad
+FRETURN    = 0xae
+DRETURN    = 0xaf
+ARETURN    = 0xb0
 RETURN     = 0xb1
 
+GETSTATIC  = 0xb2
+PUTSTATIC  = 0xb3
+GETFIELD   = 0xb4
+PUTFIELD   = 0xb5
 INVOKEVIRTUAL = 0xb6
 INVOKESPECIAL = 0xb7
 INVOKESTATIC  = 0xb8
 INVOKEINTERFACE = 0xb9
+
+NEW        = 0xbb
