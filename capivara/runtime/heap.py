@@ -23,7 +23,7 @@ class Heap:
     def new_object(self, rc: RuntimeClass, loader) -> int:
         """
         Aloca objeto da classe 'rc', inicializando todos os campos de instância
-        (da classe e superclasses) com valor default.
+        (da classe e superclasses) com valor default. Não tenta carregar java/lang/Object.
         """
         oid = self._next_id
         self._next_id += 1
@@ -38,7 +38,12 @@ class Heap:
                 name = cp.get_utf8(f.name_index)
                 desc = cp.get_utf8(f.descriptor_index)
                 obj.fields[(cur.name, name, desc)] = _default_static_value(desc)
-            cur = loader.load_class(cur.super_name) if cur.super_name else None
+
+            # Para ao chegar em java/lang/Object (stub, não temos bytes)
+            if not cur.super_name or cur.super_name == "java/lang/Object":
+                cur = None
+            else:
+                cur = loader.load_class(cur.super_name)
 
         self._objs[oid] = obj
         return oid

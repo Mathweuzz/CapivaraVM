@@ -192,7 +192,6 @@ class Interpreter:
             elif op == OP.POP:
                 top = frame.pop_slot()
                 if getattr(top, "__class__", None).__name__ == "VMTop":
-                    # pop erroneamente sobre 2-slot; remover também o valor
                     frame.pop_slot()
 
             # ===== Aritmética =====
@@ -265,7 +264,6 @@ class Interpreter:
                 if isinstance(t, BaseType) and t.code == "I":
                     frame.push_int(val.value)
                 else:
-                    # array/obj
                     frame.push_ref(val.value)
             elif op == OP.PUTSTATIC:
                 idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
@@ -336,8 +334,6 @@ class Interpreter:
             elif op == OP.INVOKESPECIAL:
                 idx = (code_bytes[pc] << 8) | code_bytes[pc+1]; pc += 2
                 owner, name, desc = self._resolve_methodref(cp, idx)
-                # construtores e super chamadas: usa classe resolvida (owner)
-                target_rc = self.loader.load_class(owner)
 
                 params, ret = parse_method_descriptor(desc)
                 # coletar args (direita->esquerda) e 'this'
@@ -352,15 +348,21 @@ class Interpreter:
                 if this_ref is None:
                     raise RuntimeError("NullPointerException (invokespecial)")
 
-                # localizar Code do método na hierarquia do owner
-                _, code_attr = self._lookup_instance_in_hierarchy(target_rc, name, desc)
+                # Caso especial: java/lang/Object.<init>()V -> no-op
+                if owner == "java/lang/Object" and name == "<init>" and isinstance(ret, BaseType) and ret.code == "V" and len(arg_vals) == 0:
+                    # nada a fazer além de consumir 'this'
+                    pass
+                else:
+                    # localizar Code do método na hierarquia do owner
+                    target_rc = self.loader.load_class(owner)
+                    _, code_attr = self._lookup_instance_in_hierarchy(target_rc, name, desc)
 
-                callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
-                callee.set_local_ref(0, this_ref)
-                for i, v in enumerate(arg_vals, start=1):
-                    callee.set_local_int(i, v)
+                    callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
+                    callee.set_local_ref(0, this_ref)
+                    for i, v in enumerate(arg_vals, start=1):
+                        callee.set_local_int(i, v)
 
-                res = self._run_frame(target_rc, code_attr, callee)
+                    _ = self._run_frame(target_rc, code_attr, callee)
                 # construtor/void -> nada a empilhar
 
             elif op == OP.INVOKEVIRTUAL:
