@@ -1,10 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from capivara.util import opcodes as OP
-from capivara.runtime.frame import Frame, StackUnderflowError
-from capivara.runtime.values import make_int
+from capivara.runtime.frame import Frame
+from capivara.util.descriptors import parse_method_descriptor, BaseType
+from capivara.loader.loader import ClassLoader
+from capivara.runtime.klass import RuntimeClass
+from capivara.classfile.constant_pool import (
+    ConstantPool, CpMethodref, CpClass, CpNameAndType
+)
+from capivara.classfile.attributes import CodeAttribute
+from capivara.util import flags as FL
 
 @dataclass
 class ExecResult:
@@ -13,20 +20,19 @@ class ExecResult:
 
 class Interpreter:
     """
-    Laço do intérprete p/ subset de inteiros e controle de fluxo.
-    Método alvo deve ser 'static' e sem argumentos (neste passo).
+    Intérprete com suporte a invocações (neste passo: invokestatic).
+    Mantém referência ao ClassLoader para resolver classes/métodos.
     """
-    def __init__(self):
-        pass
+    def __init__(self, loader: ClassLoader):
+        self.loader = loader
 
+    # ===== utils numéricas =====
     @staticmethod
     def _s1(b: int) -> int:
-        # converte byte (0..255) para signed (-128..127)
         return b - 256 if b >= 128 else b
 
     @staticmethod
     def _s2(hi: int, lo: int) -> int:
-        # 16-bit signed
         v = (hi << 8) | lo
         return v - 65536 if v >= 32768 else v
 
@@ -34,23 +40,40 @@ class Interpreter:
     def _idiv(a: int, b: int) -> int:
         if b == 0:
             raise ZeroDivisionError("divisão por zero (idiv)")
-        return int(a / b)  # trunca para zero
+        return int(a / b)
 
     @staticmethod
     def _irem(a: int, b: int) -> int:
         if b == 0:
             raise ZeroDivisionError("divisão por zero (irem)")
-        return a - int(a / b) * b  # resto com sinal do dividendo (semântica Java)
+        return a - int(a / b) * b
 
-    def exec_code(self, code: bytes, max_locals: int, max_stack: int) -> ExecResult:
-        fr = Frame(max_locals=max_locals, max_stack=max_stack)
-        # Nota: Locals já ficam em zero/null por padrão em Java; nosso Frame inicia com None.
-        # Para este passo, só usaremos locals explicitamente setados por bytecodes.
+    # ===== resolução CP → método =====
+    def _resolve_methodref(self, cp: ConstantPool, index: int) -> Tuple[str, str, str]:
+        """
+        Retorna (owner_internal_name, method_name, descriptor) a partir de um índice Methodref.
+        """
+        e = cp.get(index)
+        if not isinstance(e, CpMethodref):
+            raise TypeError("índice não é Methodref")
+        cls = cp.get(e.class_index)
+        assert isinstance(cls, CpClass)
+        owner = cp.get_utf8(cls.name_index)
+        nt = cp.get(e.name_and_type_index)
+        assert isinstance(nt, CpNameAndType)
+        name = cp.get_utf8(nt.name_index)
+        desc = cp.get_utf8(nt.descriptor_index)
+        return owner, name, desc
 
+    # ===== Execução de um método (frame) =====
+    def _run_frame(self, rc: RuntimeClass, code: CodeAttribute, frame: Frame) -> ExecResult:
+        cp = rc.cf.constant_pool
+        code_bytes = code.code
         pc = 0
-        n = len(code)
+        n = len(code_bytes)
+
         while pc < n:
-            op = code[pc]
+            op = code_bytes[pc]
             pc += 1
 
             # ===== Constantes =====
@@ -58,59 +81,59 @@ class Interpreter:
                 continue
             elif OP.ICONST_M1 <= op <= OP.ICONST_5:
                 v = -1 if op == OP.ICONST_M1 else (op - OP.ICONST_0)
-                fr.push_int(v)
+                frame.push_int(v)
             elif op == OP.BIPUSH:
-                b = code[pc]; pc += 1
-                fr.push_int(self._s1(b))
+                b = code_bytes[pc]; pc += 1
+                frame.push_int(self._s1(b))
             elif op == OP.SIPUSH:
-                hi = code[pc]; lo = code[pc+1]; pc += 2
-                fr.push_int(self._s2(hi, lo))
+                hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
+                frame.push_int(self._s2(hi, lo))
 
             # ===== Loads/Stores =====
             elif op == OP.ILOAD:
-                idx = code[pc]; pc += 1
-                fr.push_int(fr.get_local_int(idx))
+                idx = code_bytes[pc]; pc += 1
+                frame.push_int(frame.get_local_int(idx))
             elif op in (OP.ILOAD_0, OP.ILOAD_1, OP.ILOAD_2, OP.ILOAD_3):
                 idx = op - OP.ILOAD_0
-                fr.push_int(fr.get_local_int(idx))
+                frame.push_int(frame.get_local_int(idx))
             elif op == OP.ISTORE:
-                idx = code[pc]; pc += 1
-                v = fr.pop_int()
-                fr.set_local_int(idx, v)
+                idx = code_bytes[pc]; pc += 1
+                v = frame.pop_int()
+                frame.set_local_int(idx, v)
             elif op in (OP.ISTORE_0, OP.ISTORE_1, OP.ISTORE_2, OP.ISTORE_3):
                 idx = op - OP.ISTORE_0
-                v = fr.pop_int()
-                fr.set_local_int(idx, v)
+                v = frame.pop_int()
+                frame.set_local_int(idx, v)
             elif op == OP.IINC:
-                idx = code[pc]; const = self._s1(code[pc+1]); pc += 2
-                cur = fr.get_local_int(idx)
-                fr.set_local_int(idx, cur + const)
+                idx = code_bytes[pc]; const = self._s1(code_bytes[pc+1]); pc += 2
+                cur = frame.get_local_int(idx)
+                frame.set_local_int(idx, cur + const)
             elif op == OP.INEG:
-                v = fr.pop_int()
-                fr.push_int(-v)
+                v = frame.pop_int()
+                frame.push_int(-v)
 
             # ===== Aritmética =====
             elif op == OP.IADD:
-                b = fr.pop_int(); a = fr.pop_int()
-                fr.push_int(a + b)
+                b = frame.pop_int(); a = frame.pop_int()
+                frame.push_int(a + b)
             elif op == OP.ISUB:
-                b = fr.pop_int(); a = fr.pop_int()
-                fr.push_int(a - b)
+                b = frame.pop_int(); a = frame.pop_int()
+                frame.push_int(a - b)
             elif op == OP.IMUL:
-                b = fr.pop_int(); a = fr.pop_int()
-                fr.push_int(a * b)
+                b = frame.pop_int(); a = frame.pop_int()
+                frame.push_int(a * b)
             elif op == OP.IDIV:
-                b = fr.pop_int(); a = fr.pop_int()
-                fr.push_int(self._idiv(a, b))
+                b = frame.pop_int(); a = frame.pop_int()
+                frame.push_int(self._idiv(a, b))
             elif op == OP.IREM:
-                b = fr.pop_int(); a = fr.pop_int()
-                fr.push_int(self._irem(a, b))
+                b = frame.pop_int(); a = frame.pop_int()
+                frame.push_int(self._irem(a, b))
 
             # ===== Condicionais (1 operando) =====
             elif op in (OP.IFEQ, OP.IFNE, OP.IFLT, OP.IFGE, OP.IFGT, OP.IFLE):
-                hi = code[pc]; lo = code[pc+1]; pc += 2
+                hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 off = self._s2(hi, lo)
-                v = fr.pop_int()
+                v = frame.pop_int()
                 cond = (
                     (op == OP.IFEQ and v == 0) or
                     (op == OP.IFNE and v != 0) or
@@ -120,13 +143,13 @@ class Interpreter:
                     (op == OP.IFLE and v <= 0)
                 )
                 if cond:
-                    pc = pc + off - 3  # -3 pois já consumimos opcode+2 bytes do offset
+                    pc = pc + off - 3
 
             # ===== Condicionais (2 operandos) =====
             elif op in (OP.IF_ICMPEQ, OP.IF_ICMPNE, OP.IF_ICMPLT, OP.IF_ICMPGE, OP.IF_ICMPGT, OP.IF_ICMPLE):
-                hi = code[pc]; lo = code[pc+1]; pc += 2
+                hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 off = self._s2(hi, lo)
-                b = fr.pop_int(); a = fr.pop_int()
+                b = frame.pop_int(); a = frame.pop_int()
                 cond = (
                     (op == OP.IF_ICMPEQ and a == b) or
                     (op == OP.IF_ICMPNE and a != b) or
@@ -140,18 +163,93 @@ class Interpreter:
 
             # ===== Goto =====
             elif op == OP.GOTO:
-                hi = code[pc]; lo = code[pc+1]; pc += 2
+                hi = code_bytes[pc]; lo = code_bytes[pc+1]; pc += 2
                 off = self._s2(hi, lo)
                 pc = pc + off - 3
 
+            # ===== Invocações =====
+            elif op == OP.INVOKESTATIC:
+                idx_hi = code_bytes[pc]; idx_lo = code_bytes[pc+1]; pc += 2
+                index = (idx_hi << 8) | idx_lo
+                owner, name, desc = self._resolve_methodref(cp, index)
+
+                # Resolve classe e método
+                target_rc: RuntimeClass = self.loader.load_class(owner)
+                target_m = target_rc.find_method(name, desc)
+                if not target_m:
+                    raise LookupError(f"método não encontrado: {owner}.{name}{desc}")
+                if (target_m.access_flags & FL.ACC_STATIC) == 0:
+                    raise TypeError(f"método não é static: {owner}.{name}{desc}")
+
+                # Parse descritor e coletar argumentos da pilha (direita→esquerda)
+                params, ret = parse_method_descriptor(desc)
+                # Suporte neste passo: somente parâmetros 1-slot (int). (long/double virão depois)
+                arg_vals: List[int] = []
+                for p in reversed(params):
+                    if isinstance(p, BaseType) and p.code == "I":
+                        arg_vals.append(frame.pop_int())
+                    else:
+                        raise NotImplementedError("apenas parâmetros int neste passo")
+                arg_vals.reverse()
+
+                # Code alvo
+                code_attr: CodeAttribute | None = None
+                for a in target_m.attributes:
+                    if isinstance(a, CodeAttribute):
+                        code_attr = a
+                        break
+                if not code_attr:
+                    raise RuntimeError("método alvo sem atributo Code")
+
+                # Cria frame do callee e injeta argumentos nos locals 0..n-1
+                callee = Frame(max_locals=code_attr.max_locals, max_stack=code_attr.max_stack)
+                for i, v in enumerate(arg_vals):
+                    callee.set_local_int(i, v)
+
+                # Executa recursivamente
+                res = self._run_frame(target_rc, code_attr, callee)
+                # Retorno (int/void por enquanto)
+                if isinstance(ret, BaseType) and ret.code == "I":
+                    frame.push_int(res.int_value if res.int_value is not None else 0)
+                elif isinstance(ret, BaseType) and ret.code == "V":
+                    pass
+                else:
+                    raise NotImplementedError("retornos não-int/void virão em passos seguintes")
+
+            elif op == OP.INVOKESPECIAL:
+                raise NotImplementedError("invokespecial será habilitado no Passo 8 (objetos)")
+
+            elif op == OP.INVOKEVIRTUAL:
+                raise NotImplementedError("invokevirtual será habilitado no Passo 8 (objetos)")
+
             # ===== Retornos =====
             elif op == OP.IRETURN:
-                v = fr.pop_int()
+                v = frame.pop_int()
                 return ExecResult("int", v)
             elif op == OP.RETURN:
                 return ExecResult("void")
 
             else:
                 raise NotImplementedError(f"Opcode 0x{op:02x} não suportado neste passo")
-        # Se sair do loop sem return:
+
         return ExecResult("void")
+
+    # ===== API externa =====
+    def execute_method(self, rc: RuntimeClass, name: str, desc: str) -> ExecResult:
+        m = rc.find_method(name, desc)
+        if not m:
+            raise LookupError(f"método não encontrado: {rc.name}.{name}{desc}")
+        code: CodeAttribute | None = None
+        for a in m.attributes:
+            if isinstance(a, CodeAttribute):
+                code = a
+                break
+        if not code:
+            raise RuntimeError("método sem atributo Code")
+        frame = Frame(max_locals=code.max_locals, max_stack=code.max_stack)
+        return self._run_frame(rc, code, frame)
+
+    def execute_static_entry(self, main_bin: str, name: str, desc: str) -> ExecResult:
+        rc = self.loader.load_class(main_bin)
+        # (Opcional: validar ACC_STATIC do entry; o teste usa static)
+        return self.execute_method(rc, name, desc)
